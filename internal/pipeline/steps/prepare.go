@@ -31,6 +31,23 @@ func ensurePrepared(sctx *pipeline.StepContext, logStep types.StepName) error {
 	if prepareCmd == "" {
 		return nil
 	}
+	if sctx.Config.ControlledExecution {
+		// Assessment never creates Git markers, materializes source dependencies,
+		// or runs the legacy reset/restore cleanup (itself a source mutation).
+		return sctx.Shared.EnsurePrepared(func() error {
+			output, code, err := runStepShellCommand(sctx, prepareCmd)
+			if output != "" {
+				logCommandOutput(sctx, output, "Prepare", logStep)
+			}
+			if err != nil {
+				return err
+			}
+			if code != 0 {
+				return fmt.Errorf("controlled read-only prepare command exited with code %d", code)
+			}
+			return nil
+		})
+	}
 	return sctx.Shared.EnsurePrepared(func() error {
 		marker, err := preparationMarkerPath(sctx.Ctx, sctx.WorkDir)
 		if err != nil {

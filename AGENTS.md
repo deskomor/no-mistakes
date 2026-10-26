@@ -6,6 +6,8 @@ This repository is a Go CLI app named `no-mistakes`.
 The binary entrypoint is `cmd/no-mistakes`; implementation code lives under `internal/`, and the package names there are the layout map (CLI in `internal/cli`, daemon in `internal/daemon`, pipeline and steps in `internal/pipeline`, agent adapters in `internal/agent`, terminal UI in `internal/tui`, shared infrastructure in `internal/git`, `internal/ipc`, `internal/config`, `internal/db`, `internal/paths`, `internal/types`).
 Build, test, and release commands are owned by the `Makefile`; read it for the full target list instead of relying on a copy here.
 
+Factory controlled-mode exceptions and the caller-owned `axi factory-auth` stdin/credential lifecycle: `docs/src/content/docs/reference/global-config.md` and `docs/src/content/docs/reference/cli.md`.
+
 Safest local verification sequence after non-trivial changes:
 
 - `gofmt -w .`

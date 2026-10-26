@@ -20,6 +20,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/custody"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/factorysandbox"
 	"github.com/kunchenguid/no-mistakes/internal/gatecontext"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
@@ -425,10 +426,23 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 	}
 
 	parkedStarted := time.Now()
+	if err := d.RecoverFactoryResponses(); err != nil {
+		slog.Error("controlled response recovery failed; refusing run recovery", "error", err)
+		return
+	}
 	plans := mgr.recoverableParkedRuns(context.Background())
 	preserved := make(map[string]struct{}, len(plans))
 	for _, plan := range plans {
 		preserved[plan.run.ID] = struct{}{}
+	}
+	// Uncertain dispatch remains inspectable and parked without an executor.
+	uncertainRuns, uncertainErr := d.FactoryUncertainRunIDs()
+	if uncertainErr != nil {
+		slog.Error("read uncertain controlled runs", "error", uncertainErr)
+		return
+	}
+	for _, id := range uncertainRuns {
+		preserved[id] = struct{}{}
 	}
 	logStartupPhase("parked_runs", parkedStarted, "preserved", len(plans))
 
@@ -484,6 +498,12 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 }
 
 func preserveStaleRunHeads(d *db.DB, p *paths.Paths, excluded map[string]struct{}) {
+	global, err := config.LoadGlobal(p.ConfigFile())
+	if err != nil {
+		slog.Warn("failed to load evidence configuration before crash preservation", "error", err)
+		global = nil
+	}
+	cfg := config.Merge(global, &config.RepoConfig{})
 	active, err := d.ActiveRunWorktrees()
 	if err != nil {
 		slog.Warn("failed to list active run heads before crash recovery", "error", err)
@@ -501,16 +521,39 @@ func preserveStaleRunHeads(d *db.DB, p *paths.Paths, excluded map[string]struct{
 		if _, err := os.Stat(workDir); err != nil {
 			continue
 		}
-		preserveRunHead(d, workDir, run)
+		preserveRunHead(d, p, cfg, workDir, run)
 	}
 }
 
-func preserveRunHead(d *db.DB, workDir string, run *db.Run) (string, bool) {
+func preserveRunHead(d *db.DB, p *paths.Paths, cfg *config.Config, workDir string, run *db.Run) (string, bool) {
 	if d == nil || run == nil || strings.TrimSpace(workDir) == "" {
 		return "", false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	// Startup and panic recovery need a fresh deadline, not a fresh capability.
+	// Enrollment survives config changes and must be checked before reading Git.
+	enrolled, err := d.FactoryControlledRepoRunID(run.RepoID)
+	if err != nil {
+		slog.Warn("failed to resolve managed run custody before terminalization", "run", run.ID, "error", err)
+		return "", false
+	}
+	if enrolled != "" || cfg != nil && cfg.ControlledExecution {
+		repo, err := d.GetRepo(run.RepoID)
+		if err != nil || repo == nil || p == nil {
+			slog.Warn("failed to resolve managed run repository before terminalization", "run", run.ID, "error", err)
+			return "", false
+		}
+		var evidenceRoot *string
+		if cfg != nil {
+			evidenceRoot = &cfg.Test.Evidence.LocalRoot
+		}
+		ctx, _, err = lifecycleGitContext(ctx, d, p, cfg != nil && cfg.ControlledExecution, evidenceRoot, repo, run.ID, workDir)
+		if err != nil {
+			slog.Warn("failed to attach terminal custody policy", "run", run.ID, "error", err)
+			return "", false
+		}
+	}
 	head, err := git.HeadSHA(ctx, workDir)
 	if err != nil {
 		slog.Warn("failed to read managed worktree head before terminalization", "run", run.ID, "error", err)
@@ -788,7 +831,7 @@ func cleanupOrphanWorktrees(d *db.DB, p *paths.Paths, leftover []db.RunWorktree)
 	sweepRunWorktrees(p.WorktreesDir(), sweepable, "worktree_cleanup")
 
 	for _, wt := range removable {
-		removeOrphanWorktree(ctx, wt)
+		removeOrphanWorktree(ctx, d, p, wt)
 	}
 	for _, dir := range repoDirs {
 		os.Remove(dir)
@@ -832,7 +875,7 @@ func defaultTreeOrphanWorktrees(d *db.DB, p *paths.Paths) (removable []orphanWor
 				repoID:  repoEntry.Name(),
 				runID:   runEntry.Name(),
 			}
-			if removableOrphanWorktree(d, wt) {
+			if removableOrphanWorktree(d, p, wt) {
 				removable = append(removable, wt)
 			}
 		}
@@ -860,7 +903,7 @@ func recordedOrphanWorktrees(d *db.DB, p *paths.Paths, leftover []db.RunWorktree
 			continue
 		}
 		candidate := orphanWorktree{gateDir: p.RepoDir(wt.RepoID), dir: wt.Dir, repoID: wt.RepoID, runID: wt.RunID}
-		if removableOrphanWorktree(d, candidate) {
+		if removableOrphanWorktree(d, p, candidate) {
 			removable = append(removable, candidate)
 		}
 	}
@@ -870,7 +913,11 @@ func recordedOrphanWorktrees(d *db.DB, p *paths.Paths, leftover []db.RunWorktree
 // removableOrphanWorktree combines the active-run guard with refusal retention.
 // This removal decision does not exempt retained terminal runs from the
 // independent startup process sweep or evidence expiry.
-func removableOrphanWorktree(d *db.DB, wt orphanWorktree) bool {
+func removableOrphanWorktree(d *db.DB, p *paths.Paths, wt orphanWorktree) bool {
+	if err := validateLifecycleCleanupOwner(d, p, wt.repoID, wt.runID, wt.dir); err != nil {
+		slog.Warn("preserving unowned orphaned worktree", "path", wt.dir, "error", err)
+		return false
+	}
 	if skip, reason := skipWorktreeCleanup(context.Background(), d, wt.runID, wt.dir); skip {
 		slog.Info("skipping worktree cleanup", "path", wt.dir, "reason", reason)
 		return false
@@ -889,15 +936,26 @@ func removableOrphanWorktree(d *db.DB, wt orphanWorktree) bool {
 
 // removeOrphanWorktree removes one run worktree directory its caller has
 // already decided on and swept (see cleanupOrphanWorktrees).
-func removeOrphanWorktree(ctx context.Context, wt orphanWorktree) {
-	gateDir, wtPath := wt.gateDir, wt.dir
-	if err := git.WorktreeRemove(ctx, gateDir, wtPath); err != nil {
-		slog.Warn("git worktree remove failed, falling back to os.RemoveAll", "path", wtPath, "error", err)
-		if err := os.RemoveAll(wtPath); err != nil {
-			slog.Warn("failed to remove orphaned worktree", "path", wtPath, "error", err)
+func removeOrphanWorktree(ctx context.Context, d *db.DB, p *paths.Paths, wt orphanWorktree) {
+	cfg, cfgErr := config.LoadGlobal(p.ConfigFile())
+	enrolled, enrollmentErr := d.FactoryControlledRepoRunID(wt.repoID)
+	if cfgErr != nil || enrollmentErr != nil {
+		slog.Warn("preserving orphaned worktree: lifecycle policy unavailable", "path", wt.dir)
+		return
+	}
+	if cfg.ControlledExecution || enrolled != "" {
+		if err := removeLifecycleWorktree(ctx, d, p, wt.repoID, wt.runID, wt.gateDir, wt.dir); err != nil {
+			slog.Warn("preserving controlled orphaned worktree", "path", wt.dir, "error", err)
+		}
+		return
+	}
+	if err := git.WorktreeRemove(ctx, wt.gateDir, wt.dir); err != nil {
+		slog.Warn("git worktree remove failed, falling back to os.RemoveAll", "path", wt.dir, "error", err)
+		if err := os.RemoveAll(wt.dir); err != nil {
+			slog.Warn("failed to remove orphaned worktree", "path", wt.dir, "error", err)
 		}
 	} else {
-		slog.Info("removed orphaned worktree", "path", wtPath)
+		slog.Info("removed orphaned worktree", "path", wt.dir)
 	}
 }
 
@@ -931,6 +989,13 @@ func skipWorktreeCleanup(ctx context.Context, d *db.DB, runID, wtPath string) (b
 		return true, fmt.Sprintf("run %s is %s", runID, run.Status)
 	}
 	if run != nil && run.Status == types.RunCIMonitorInterrupted {
+		enrolled, err := d.FactoryControlledRepoRunID(run.RepoID)
+		if err != nil {
+			return true, fmt.Sprintf("cannot resolve worktree custody: %v", err)
+		}
+		if enrolled != "" {
+			ctx = factorysandbox.WithPolicy(ctx, "", []string{wtPath})
+		}
 		head, err := git.HeadSHA(ctx, wtPath)
 		if err != nil {
 			return true, fmt.Sprintf("run %s ci monitor interrupted; worktree head unreadable (%v); preserving", runID, err)
@@ -986,6 +1051,11 @@ var sweepRunWorktrees = procreap.SweepRunWorktrees
 // filesystem-only pass instead of six Git subprocesses per gate.
 func migrateGateConfigs(ctx context.Context, d *db.DB, p *paths.Paths) gateMigrationStats {
 	var stats gateMigrationStats
+	cfg, cfgErr := config.LoadGlobal(p.ConfigFile())
+	if cfgErr != nil {
+		stats.Failed++
+		return stats
+	}
 	candidates := make(map[string]struct{})
 	reposDir := filepath.Clean(p.ReposDir())
 
@@ -1029,6 +1099,31 @@ func migrateGateConfigs(ctx context.Context, d *db.DB, p *paths.Paths) gateMigra
 	}
 	sort.Strings(dirs)
 	for _, bareDir := range dirs {
+		repoID := strings.TrimSuffix(filepath.Base(bareDir), ".git")
+		repo, repoErr := d.GetRepo(repoID)
+		if repoErr != nil {
+			stats.Failed++
+			continue
+		}
+		gateCtx := ctx
+		controlled := false
+		if repo != nil {
+			var err error
+			gateCtx, controlled, err = lifecycleGitContext(ctx, d, p, cfg.ControlledExecution, cfg.Test.Evidence.LocalRoot, repo, "", "")
+			if err != nil {
+				stats.Failed++
+				continue
+			}
+		} else if cfg.ControlledExecution {
+			stats.Rejected++
+			continue
+		}
+		if controlled {
+			if err := validateLifecycleGateHostWrites(bareDir); err != nil {
+				stats.Rejected++
+				continue
+			}
+		}
 		if !git.LooksLikeBareRepository(bareDir) {
 			stats.Rejected++
 			slog.Warn("rejecting invalid gate directory", "bare", bareDir)
@@ -1039,13 +1134,13 @@ func migrateGateConfigs(ctx context.Context, d *db.DB, p *paths.Paths) gateMigra
 			stats.Current++
 			continue
 		}
-		if err := git.ValidateBareRepository(ctx, bareDir); err != nil {
+		if err := git.ValidateBareRepository(gateCtx, bareDir); err != nil {
 			stats.Rejected++
 			slog.Warn("rejecting non-bare gate directory", "bare", bareDir, "error", err)
 			continue
 		}
 		stats.Gates++
-		if err := migrateGateConfig(ctx, bareDir); err != nil {
+		if err := migrateGateConfig(gateCtx, bareDir); err != nil {
 			stats.Failed++
 			slog.Warn("migrate gate config failed", "bare", bareDir, "error", err)
 			continue
@@ -1397,6 +1492,37 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 			return nil, err
 		}
 		return &ipc.RespondResult{OK: true}, nil
+	})
+
+	srv.Handle(ipc.MethodFactoryRespond, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		if err := refuseNested(ctx, false); err != nil {
+			return nil, err
+		}
+		var q db.FactoryResponseRequest
+		if err := json.Unmarshal(params, &q); err != nil {
+			return nil, err
+		}
+		return mgr.HandleFactoryRespond(q)
+	})
+	srv.Handle(ipc.MethodFactoryGate, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		var q ipc.FactoryLookupParams
+		if err := json.Unmarshal(params, &q); err != nil {
+			return nil, err
+		}
+		if q.RunID == "" {
+			return nil, fmt.Errorf("run_id required")
+		}
+		return mgr.db.GetFactoryGate(q.RunID)
+	})
+	srv.Handle(ipc.MethodFactoryReceipt, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		var q ipc.FactoryLookupParams
+		if err := json.Unmarshal(params, &q); err != nil {
+			return nil, err
+		}
+		if q.RunID == "" || q.OperationID == "" {
+			return nil, fmt.Errorf("run_id and operation_id required")
+		}
+		return mgr.db.GetFactoryResponseReceipt(q.RunID, q.OperationID)
 	})
 
 	srv.Handle(ipc.MethodAnswerReview, func(ctx context.Context, params json.RawMessage) (interface{}, error) {

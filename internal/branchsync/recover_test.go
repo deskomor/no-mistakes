@@ -11,6 +11,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/custody"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/factorysandbox"
 	gitpkg "github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	pipelinepkg "github.com/kunchenguid/no-mistakes/internal/pipeline"
@@ -84,6 +85,10 @@ type recoverFixture struct {
 // pipeline fix commits (the preserved head), and a run row that is terminal
 // with head_sha at the preserved head and no push provenance.
 func newRecoverFixture(t *testing.T, status types.RunStatus) *recoverFixture {
+	return newRecoverFixtureWithEnrollment(t, status, false)
+}
+
+func newRecoverFixtureWithEnrollment(t *testing.T, status types.RunStatus, controlled bool) *recoverFixture {
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
@@ -128,9 +133,19 @@ func newRecoverFixture(t *testing.T, status types.RunStatus) *recoverFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := database.InsertRun(repo.ID, "feature/recover", submitted, base)
+	var run *db.Run
+	if controlled {
+		run, err = database.InsertRunWithIntentAndLaunchNonce(repo.ID, "feature/recover", submitted, base, nil, "recovery-nonce", "recovery-generation", "digest", "", false, nil)
+	} else {
+		run, err = database.InsertRun(repo.ID, "feature/recover", submitted, base)
+	}
 	if err != nil {
 		t.Fatal(err)
+	}
+	if controlled {
+		if err := database.EnsureFactoryBudget(run); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := database.UpdateRunHeadSHA(run.ID, preserved); err != nil {
 		t.Fatal(err)
@@ -145,9 +160,13 @@ func newRecoverFixture(t *testing.T, status types.RunStatus) *recoverFixture {
 		t.Fatal(statusErr)
 	}
 	run, _ = database.GetRun(run.ID)
+	var servicePaths *paths.Paths
+	if controlled {
+		servicePaths = paths.WithRoot(filepath.Join(root, "factory"))
+	}
 	return &recoverFixture{
 		t: t, ctx: ctx, db: database, repo: repo, run: run,
-		service: &Service{DB: database, Repo: repo, WorkDir: local, GateDir: gate},
+		service: &Service{DB: database, Repo: repo, WorkDir: local, GateDir: gate, Paths: servicePaths},
 		local:   local, gate: gate, remote: remote,
 		base: base, submitted: submitted, preserved: preserved,
 	}
@@ -361,6 +380,65 @@ func TestRecoverCleanBehindFastForwardsAndReturnsCustody(t *testing.T) {
 	if next.Pipeline.RunID != fresh.ID {
 		t.Fatalf("fresh run not selected after recovery: %#v", next.Pipeline)
 	}
+}
+
+func TestControlledRecoveryRetainsDurableCustodyWithoutCurrentOptIn(t *testing.T) {
+	if err := factorysandbox.Supported(); err != nil {
+		t.Skip(err)
+	}
+	// No current opt-in is enabled: the durable enrolled terminal run alone
+	// must protect both inspection and custody return.
+	f := newRecoverFixtureWithEnrollment(t, types.RunCancelled, true)
+	hostSentinel := filepath.Join(t.TempDir(), "host-sentinel")
+	mustWrite(t, hostSentinel, "untouched\n")
+	productSentinel := filepath.Join(f.local, ".git", "helper-executed")
+	script := "#!/bin/sh\nprintf attacked > '" + hostSentinel + "'\nprintf attacked > '" + productSentinel + "'\nexit 0\n"
+	for _, repo := range []string{f.local, f.gate} {
+		hooks := filepath.Join(repo, "hooks")
+		helper := filepath.Join(repo, "fsmonitor-attack")
+		if repo == f.local {
+			hooks = filepath.Join(repo, ".git", "hooks")
+			helper = filepath.Join(repo, ".git", "fsmonitor-attack")
+		}
+		if err := os.MkdirAll(hooks, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for _, file := range []string{helper, filepath.Join(hooks, "reference-transaction")} {
+			if err := os.WriteFile(file, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		mustRun(t, repo, "config", "core.fsmonitor", helper)
+	}
+	assertSentinels := func() {
+		t.Helper()
+		data, err := os.ReadFile(hostSentinel)
+		if err != nil || string(data) != "untouched\n" {
+			t.Fatalf("repository helper changed host sentinel: %q (%v)", data, err)
+		}
+		if _, err := os.Stat(productSentinel); !os.IsNotExist(err) {
+			t.Fatalf("repository helper executed inside controlled mutation: %v", err)
+		}
+	}
+	before := f.service.InspectCached(f.ctx)
+	if before.State != StatePipelineOwned || before.Safety != "blocked_pipeline_owned_recoverable" || before.NextAction == nil || before.NextAction.Code != "recover_custody" {
+		t.Fatalf("controlled recovery evidence = %#v", before)
+	}
+	assertSentinels()
+	state := f.service.Recover(f.ctx, false)
+	if !state.Recovered || !state.Changed || state.State != StateCustodyReturned {
+		t.Fatalf("controlled recovery = %#v", state)
+	}
+	if !f.custodyReturned() {
+		t.Fatal("controlled recovery did not record custody")
+	}
+	if got := mustRun(t, f.local, "rev-parse", f.anchorRef()); got != f.preserved {
+		t.Fatalf("recovery anchor = %q, want %q", got, f.preserved)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("recovered HEAD = %q, want %q", got, f.preserved)
+	}
+	assertSentinels()
 }
 
 func TestRecoverFastForwardRechecksCurrentBranchBeforeMerge(t *testing.T) {

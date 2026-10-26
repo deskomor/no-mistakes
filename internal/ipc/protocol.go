@@ -26,6 +26,9 @@ const (
 	MethodRerun                   = "rerun"
 	MethodSubscribe               = "subscribe"
 	MethodRespond                 = "respond"
+	MethodFactoryRespond          = "factory_respond"
+	MethodFactoryGate             = "factory_gate"
+	MethodFactoryReceipt          = "factory_receipt"
 	MethodAnswerReview            = "answer_review_question"
 	MethodCancelRun               = "cancel_run"
 	MethodGateContext             = "gate_context"
@@ -255,6 +258,12 @@ type RespondParams struct {
 // CancelRunParams cancels an active pipeline run.
 type CancelRunParams struct {
 	RunID string `json:"run_id"`
+}
+
+// FactoryLookupParams selects an exact durable run; no branch fallback.
+type FactoryLookupParams struct {
+	RunID       string `json:"run_id"`
+	OperationID string `json:"operation_id,omitempty"`
 }
 
 // GateContextParams asks the daemon to classify the authenticated caller.

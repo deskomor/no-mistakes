@@ -62,6 +62,42 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 		ag = sctx.Agent
 		timeout = AgentTimeout(sctx.Config)
 	}
+	if sctx != nil && sctx.Config != nil && sctx.Config.ControlledExecution {
+		if sctx.DB == nil || sctx.Run == nil {
+			return nil, errors.New("controlled invocation requires an enrolled run")
+		}
+		enrolled, err := sctx.DB.IsFactoryControlledRun(sctx.Run.ID)
+		if err != nil {
+			return nil, err
+		}
+		if !enrolled {
+			return nil, errors.New("controlled run is not enrolled")
+		}
+		opts.FactoryControlled = true
+		opts.FactoryEvidenceDir = sctx.EvidenceDir
+		opts.FactoryProtectedPaths = []string{sctx.WorkDir, sctx.GateDir}
+		if sctx.Repo != nil {
+			opts.FactoryProtectedPaths = append(opts.FactoryProtectedPaths, sctx.Repo.WorkingPath)
+		}
+		// Only explicitly marked repair turns can claim the reservation.
+		// Reviewer, evidence, analyzer and schema-correction turns stay read-only.
+		if opts.FactoryMutation {
+			if !sctx.Fixing || sctx.SkipFixExecution {
+				return nil, errors.New("mutation turn requires an authorized repair round")
+			}
+			if err := sctx.DB.ClaimFactoryRepairDispatch(sctx.FactoryRepairID, sctx.Run.ID, sctx.StepResultID); err != nil {
+				return nil, err
+			}
+			parent = context.WithValue(parent, factoryMutationContextKey{}, &factoryMutationToken{
+				runID: sctx.Run.ID, stepID: sctx.StepResultID, repairID: sctx.FactoryRepairID,
+			})
+		} else {
+			opts.Prompt += "\n\nCONTROLLED ASSESSMENT: source and Git writes are denied by the OS. Do not edit source, tests, setup, documentation, or formatters. Report every required change as a finding. Run read-only checks; place runtime/evidence only in the permitted scratch or evidence directory."
+		}
+		// A failed resume cannot safely prove no mutation dispatch.
+		sessionRole = ""
+		opts.Session = nil
+	}
 	activity := observeAgentActivity(&opts)
 	return invokeAgent(parent, timeout, activity, func(ctx context.Context) (*agent.Result, error) {
 		if sessionRole != "" && sctx != nil && sctx.Sessions != nil {

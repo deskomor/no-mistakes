@@ -308,6 +308,14 @@ func commitAgentFixes(sctx *pipeline.StepContext, stepName types.StepName, summa
 }
 
 func commitAgentFixesWithResult(sctx *pipeline.StepContext, stepName types.StepName, summary, fallbackSummary string) (bool, error) {
+	if sctx.Config != nil && sctx.Config.ControlledExecution {
+		if sctx.DB == nil || sctx.Run == nil {
+			return false, errors.New("controlled commit requires enrolled repair")
+		}
+		if err := sctx.DB.ValidateFactoryRepair(sctx.FactoryRepairID, sctx.Run.ID, sctx.StepResultID); err != nil {
+			return false, err
+		}
+	}
 	ctx := sctx.Ctx
 	if err := assertPipelineHeadContinuity(sctx, stepName); err != nil {
 		return false, err
@@ -426,12 +434,13 @@ func executeFixMode(sctx *pipeline.StepContext, stepName types.StepName, opts fi
 		purpose = string(stepName) + "-fix"
 	}
 	runOpts := agent.RunOpts{
-		Prompt:     fixerPrompt(opts.Prompt),
-		CWD:        sctx.WorkDir,
-		JSONSchema: commitSummarySchema,
-		OnChunk:    sctx.LogChunk,
-		Purpose:    purpose,
-		Workload:   opts.Workload,
+		FactoryMutation: sctx.Config != nil && sctx.Config.ControlledExecution,
+		Prompt:          fixerPrompt(opts.Prompt),
+		CWD:             sctx.WorkDir,
+		JSONSchema:      commitSummarySchema,
+		OnChunk:         sctx.LogChunk,
+		Purpose:         purpose,
+		Workload:        opts.Workload,
 	}
 	var result *agent.Result
 	var err error

@@ -136,6 +136,7 @@ const (
 
 // GlobalConfig represents ~/.no-mistakes/config.yaml.
 type GlobalConfig struct {
+	ControlledExecution  bool                `yaml:"controlled_execution"`
 	SourceYAML           []byte              `yaml:"-"`
 	Agent                types.AgentName     `yaml:"agent"`
 	Agents               []types.AgentName   `yaml:"-"`
@@ -211,6 +212,7 @@ type GlobalConfig struct {
 
 // globalConfigRaw is the on-disk YAML representation with duration as string.
 type globalConfigRaw struct {
+	ControlledExecution     bool                       `yaml:"controlled_execution"`
 	Agent                   agentList                  `yaml:"agent"`
 	ACPXPath                string                     `yaml:"acpx_path"`
 	ForgejoAXIPath          string                     `yaml:"forgejo_axi_path"`
@@ -682,6 +684,7 @@ type AutoFix struct {
 
 // Config is the merged result of global + per-repo configuration.
 type Config struct {
+	ControlledExecution   bool
 	ReplayGlobalYAML      []byte
 	ReplayRepoYAML        []byte
 	TrustedConfigSHA      string
@@ -2177,6 +2180,7 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 		return nil, fmt.Errorf("parse global config: %w", err)
 	}
 	warnRetiredJev(raw.Jev)
+	cfg.ControlledExecution = raw.ControlledExecution
 
 	if len(raw.Agent) > 0 {
 		cfg.Agents = copyAgents(raw.Agent)
@@ -3159,6 +3163,7 @@ func merge(global *GlobalConfig, repo *RepoConfig, override *RepositoryOverride)
 	}
 
 	cfg := &Config{
+		ControlledExecution:   global.ControlledExecution,
 		Agent:                 global.Agent,
 		Agents:                copyAgents(global.Agents),
 		ACPXPath:              global.ACPXPath,

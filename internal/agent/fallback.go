@@ -106,6 +106,9 @@ func (a *fallbackAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) 
 			return result, nil
 		}
 		lastErr = err
+		if opts.FactoryControlled {
+			return nil, err
+		}
 		// A fallback is another attempt inside this invocation's existing
 		// bounded context, not a fresh timeout policy. Once that context has
 		// expired or been cancelled, the next candidate cannot start

@@ -17,6 +17,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/custody"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/factorysandbox"
 	"github.com/kunchenguid/no-mistakes/internal/forgecontext"
 	"github.com/kunchenguid/no-mistakes/internal/gateguidance"
 	"github.com/kunchenguid/no-mistakes/internal/git"
@@ -67,6 +68,9 @@ type Executor struct {
 	waiting                bool                  // true when blocked on approval
 	waitingStep            types.StepName        // which step is currently awaiting approval
 	waitingApprovalRefusal string                // non-empty: why Approve is rejected at the waiting gate
+	factoryRunID           string
+	factoryControlled      bool
+	factoryOperation       string
 
 	gateReconcileInterval time.Duration
 	gateReconcileTimeout  time.Duration
@@ -192,6 +196,10 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 		return fmt.Errorf("unrecognized approval action %q (valid: approve, fix, skip, abort, answer)", action)
 	}
 	e.mu.Lock()
+	if e.factoryControlled {
+		e.mu.Unlock()
+		return fmt.Errorf("controlled run requires factory_respond with exact gate and operation identity")
+	}
 	if !e.waiting {
 		e.mu.Unlock()
 		return fmt.Errorf("no step awaiting approval")
@@ -223,8 +231,22 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 // If the context is cancelled with a cause (via context.WithCancelCause),
 // the cause message is preserved as the run's error in the DB.
 func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, workDir string) error {
+	if err := e.enrollFactoryRun(run); err != nil {
+		return e.failRun(run, repo, fmt.Errorf("controlled execution admission: %w", err))
+	}
+	if err := e.bindFactoryRun(run.ID); err != nil {
+		return err
+	}
+	defer e.completeFactoryOperation()
 	e.workDir = workDir
 	ctx = e.runContext(ctx)
+	if e.factoryControlled {
+		policyCtx, err := e.factoryGitContext(ctx, run.ID, repo, workDir)
+		if err != nil {
+			return e.failRun(run, repo, fmt.Errorf("controlled mirror scope: %w", err))
+		}
+		ctx = policyCtx
+	}
 	// Mark run as running. Route write failures through failRun so the
 	// in-memory lifecycle and subscriber stream still become terminal instead
 	// of leaving a silent pending run.
@@ -406,6 +428,19 @@ func ValidateRecoveredRun(database *db.DB, run *db.Run, steps []Step) error {
 	if run == nil || run.Status != types.RunRunning || run.AwaitingAgentSince == nil {
 		return fmt.Errorf("run is not a recoverable parked run")
 	}
+	controlled, controlErr := database.IsFactoryControlledRun(run.ID)
+	if controlErr != nil {
+		return controlErr
+	}
+	if controlled {
+		g, gateErr := database.GetFactoryGate(run.ID)
+		if gateErr != nil {
+			return gateErr
+		}
+		if g == nil || g.State != "parked" || g.HeadSHA != run.HeadSHA {
+			return fmt.Errorf("controlled run has unavailable or uncertain gate; inspect response receipt, never replay")
+		}
+	}
 	_, err := (&Executor{db: database, steps: steps}).recoveredGate(run.ID)
 	return err
 }
@@ -414,8 +449,22 @@ func ValidateRecoveredRun(database *db.DB, run *db.Run, steps []Step) error {
 // daemon stopped. It only accepts a fully recorded gate and otherwise returns
 // an error so startup recovery can fail the run rather than guessing.
 func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workDir string) error {
+	if err := e.enrollFactoryRun(run); err != nil {
+		return fmt.Errorf("controlled recovery admission: %w", err)
+	}
+	if err := e.bindFactoryRun(run.ID); err != nil {
+		return err
+	}
+	defer e.completeFactoryOperation()
 	e.workDir = workDir
 	ctx = e.runContext(ctx)
+	if e.factoryControlled && repo != nil {
+		policyCtx, err := e.factoryGitContext(ctx, run.ID, repo, workDir)
+		if err != nil {
+			return fmt.Errorf("controlled recovery mirror scope: %w", err)
+		}
+		ctx = policyCtx
+	}
 	if repo == nil {
 		return fmt.Errorf("recovered run has no repository")
 	}
@@ -504,6 +553,9 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	e.waiting = true
 	e.waitingStep = gate.step.Name()
 	e.waitingApprovalRefusal = approvalRefusal(gate.step.Name(), gate.findings)
+	if refusal := factoryBudgetApprovalRefusal(gate.findings); refusal != "" {
+		e.waitingApprovalRefusal = refusal
+	}
 	e.mu.Unlock()
 	e.emitStepEventWithFindingsAndError(
 		ipc.EventStepCompleted,
@@ -834,6 +886,11 @@ func recoveredLogPath(step *db.StepResult) string {
 }
 
 func (e *Executor) autoFixLimit(stepName types.StepName) int {
+	if e.factoryControlled {
+		// Studio owns repair authorization; repository overrides cannot restore
+		// an internal automatic loop in a controlled run.
+		return 0
+	}
 	if e.config == nil {
 		return 0
 	}
@@ -1062,6 +1119,9 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		MarkRunning:        markRunning,
 		OnPRMerged:         e.onPRMerged,
 	}
+	if e.factoryControlled {
+		sctx.Agent = &factoryBoundaryAgent{inner: stepAgent, step: sctx}
+	}
 	if stepName == types.StepReview {
 		BindUncertifiedPipelineRange(sctx)
 		// Must follow BindUncertifiedPipelineRange: it skips a run whose
@@ -1104,7 +1164,27 @@ rounds:
 	for {
 		reviewStartingHeadSHA := run.HeadSHA
 		sctx.ReviewStartingHeadSHA = reviewStartingHeadSHA
-		outcome, err := step.Execute(sctx)
+		var outcome *StepOutcome
+		err = nil
+		sctx.FactoryRepairID = ""
+		if e.factoryControlled && sctx.Fixing && !sctx.SkipFixExecution {
+			repair, reserveErr := e.db.ReserveFactoryRepair(run.ID, sr.ID, roundNum+1)
+			if reserveErr != nil {
+				if !errors.Is(reserveErr, db.ErrFactoryBudgetExhausted) && !errors.Is(reserveErr, db.ErrFactoryRepairDispatched) {
+					return false, "", fmt.Errorf("reserve controlled repair: %w", reserveErr)
+				}
+				// No phase/agent/command is dispatched for a refused pass.
+				writeLog(reserveErr.Error())
+				outcome = factoryBudgetOutcome(reserveErr)
+				sctx.Fixing = false
+				nextTrigger = "budget_refusal"
+			} else {
+				sctx.FactoryRepairID = repair.ID
+			}
+		}
+		if outcome == nil {
+			outcome, err = step.Execute(sctx)
+		}
 		if refusal := ProtectedPathOutcome(err); refusal != nil {
 			outcome, err = refusal, nil
 		}
@@ -1304,6 +1384,9 @@ rounds:
 			e.waiting = true
 			e.waitingStep = stepName
 			e.waitingApprovalRefusal = approvalRefusal(stepName, effectiveFindings)
+			if refusal := factoryBudgetApprovalRefusal(effectiveFindings); refusal != "" {
+				e.waitingApprovalRefusal = refusal
+			}
 			e.mu.Unlock()
 
 			// Parking starts before the gate becomes observable. This includes the
@@ -1321,6 +1404,19 @@ rounds:
 				e.waitingStep = ""
 				e.mu.Unlock()
 				return false, "", fmt.Errorf("persist %s approval gate: %w", stepName, dbErr)
+			}
+			if e.factoryControlled {
+				e.completeFactoryOperation()
+				head, headErr := git.HeadSHA(ctx, e.workDir)
+				if headErr != nil {
+					return false, "", headErr
+				}
+				if head != run.HeadSHA {
+					return false, "", fmt.Errorf("controlled gate head differs from recorded run head")
+				}
+				if _, gateErr := e.db.ParkFactoryGate(run.ID, sr.ID, roundNum, head); gateErr != nil {
+					return false, "", gateErr
+				}
 			}
 			e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(approvalStatus), effectiveFindings, "", &executionMS)
 
@@ -1732,6 +1828,9 @@ func (e *Executor) waitForApprovalOrReconcile(ctx context.Context, step Step, sc
 
 	_, reconciles := step.(ApprovalGateReconciler)
 	_, resumes := step.(ApprovalGateResumer)
+	if e.factoryControlled {
+		reconciles, resumes = false, false
+	}
 	if !reconciles && !resumes {
 		select {
 		case response := <-e.approvalCh:
@@ -1809,6 +1908,9 @@ func (e *Executor) claimGateReconciliation() bool {
 // completes a step - the action it returns is delivered as an ordinary gate
 // response.
 func (e *Executor) resumeApprovalGate(ctx context.Context, step Step, sctx *StepContext, findingsJSON string) (types.ApprovalAction, bool, error) {
+	if e.factoryControlled {
+		return "", false, nil
+	}
 	resumer, ok := step.(ApprovalGateResumer)
 	if !ok {
 		return "", false, nil
@@ -1828,6 +1930,9 @@ func (e *Executor) resumeApprovalGate(ctx context.Context, step Step, sctx *Step
 }
 
 func (e *Executor) reconcileApprovalGate(ctx context.Context, step Step, sctx *StepContext, findingsJSON string) (bool, error) {
+	if e.factoryControlled {
+		return false, nil
+	}
 	reconciler, ok := step.(ApprovalGateReconciler)
 	if !ok {
 		return false, nil
@@ -1913,6 +2018,21 @@ func (e *Executor) reconcileTerminalRunHead(run *db.Run) (string, bool) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	// Terminal cleanup deliberately outlives cancellation, but never the run's
+	// durable Git custody policy (including after the live switch is disabled).
+	controlled, err := e.db.IsFactoryControlledRun(run.ID)
+	if err != nil {
+		slog.Warn("failed to resolve terminal run custody", "run", run.ID, "error", err)
+		return "", false
+	}
+	if controlled {
+		repo, err := e.db.GetRepo(recordedRun.RepoID)
+		if err != nil || repo == nil || e.paths == nil {
+			slog.Warn("failed to resolve terminal run repository", "run", run.ID, "error", err)
+			return "", false
+		}
+		ctx = factorysandbox.WithPolicy(ctx, e.runEvidenceDir(run.ID), []string{e.workDir, e.paths.RepoDir(repo.ID), repo.WorkingPath})
+	}
 	observed, err := git.HeadSHA(ctx, e.workDir)
 	if err != nil {
 		slog.Warn("failed to resolve worktree head before terminalization", "run", run.ID, "error", err)

@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/kunchenguid/no-mistakes/internal/factorysandbox"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
@@ -196,6 +197,11 @@ func stepGitRun(sctx *pipeline.StepContext, args ...string) (string, error) {
 func stepGitRunRaw(sctx *pipeline.StepContext, args ...string) (string, error) {
 	cmd := stepCmd(sctx, "git", args...)
 	cmd.Env = git.NonInteractiveEnvFrom(cmd.Env, sctx.WorkDir)
+	cleanup, err := factorysandbox.WrapGitCommand(sctx.Ctx, cmd, args)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
 	out, err := cmd.Output()
 	if err != nil {
 		stderr := ""
@@ -298,6 +304,29 @@ func runShellCommand(ctx context.Context, dir, cmdStr string) (string, int, erro
 }
 
 func runStepShellCommand(sctx *pipeline.StepContext, cmdStr string) (string, int, error) {
+	if sctx.Config != nil && sctx.Config.ControlledExecution {
+		cmd := exec.CommandContext(sctx.Ctx, "sh", "-c", shellenv.OwnOOMScoreScript(cmdStr))
+		cmd.Dir = sctx.WorkDir
+		cmd.Env = stepEnvironment(sctx)
+		protected := []string{sctx.WorkDir, sctx.GateDir}
+		if sctx.Repo != nil {
+			protected = append(protected, sctx.Repo.WorkingPath)
+		}
+		cleanup, err := factorysandbox.WrapAssessment(cmd, sctx.EvidenceDir, protected, false)
+		if err != nil {
+			return "", -1, err
+		}
+		defer cleanup()
+		shellenv.ConfigureCooperativeShellCommand(cmd)
+		out, err := shellenv.CombinedOutputShellCommand(cmd)
+		if err != nil {
+			if ee, ok := err.(*exec.ExitError); ok {
+				return string(out), ee.ExitCode(), nil
+			}
+			return string(out), -1, fmt.Errorf("controlled command: %w", err)
+		}
+		return string(out), 0, nil
+	}
 	return runShellCommandWithProcessEnv(sctx.Ctx, sctx.WorkDir, stepEnvironment(sctx), cmdStr)
 }
 

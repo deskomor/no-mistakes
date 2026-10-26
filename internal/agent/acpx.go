@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/kunchenguid/no-mistakes/internal/factorysandbox"
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 )
 
@@ -52,6 +53,13 @@ func (a *acpxAgent) NeutralizesGateInstructions() bool {
 }
 
 func (a *acpxAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) {
+	if opts.FactoryControlled {
+		if err := EnsureFactoryControlled(a); err != nil {
+			return nil, err
+		}
+		// Never replay a possibly dispatched controlled turn.
+		return a.runOnce(ctx, opts)
+	}
 	return runWithRetry(ctx, a.Name(), opts, claudeMaxRetries, classifyTransient, nil, func() (*Result, error) {
 		return a.runOnce(ctx, opts)
 	})
@@ -62,7 +70,15 @@ func (a *acpxAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error) 
 	if len(opts.JSONSchema) > 0 {
 		prompt = buildACPStructuredPrompt(prompt, opts.JSONSchema)
 	}
-	rawCommand, err := a.resolveRawCommand()
+	var rawCommand string
+	var err error
+	if opts.FactoryControlled {
+		// acpx 0.21 has no built-in omp launch: the bare alias starts the
+		// interactive CLI. Controlled runs always use our verified ACP entry.
+		rawCommand, err = a.neutralizedOMPCommand()
+	} else {
+		rawCommand, err = a.resolveRawCommand()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("acpx omp gate neutralization: %w", err)
 	}
@@ -70,6 +86,18 @@ func (a *acpxAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error) 
 	cmd := exec.CommandContext(ctx, a.bin, args...)
 	cmd.Dir = opts.CWD
 	cmd.Env = a.gitSafeEnv(opts.CWD, opts.Env)
+	if opts.FactoryControlled {
+		protected := append([]string{opts.CWD}, opts.FactoryProtectedPaths...)
+		runtimePaths, err := a.factoryRuntimePaths(cmd.Env)
+		if err != nil {
+			return nil, err
+		}
+		cleanup, err := factorysandbox.WrapCommand(cmd, opts.FactoryEvidenceDir, protected, true, opts.FactoryMutation, runtimePaths...)
+		if err != nil {
+			return nil, err
+		}
+		defer cleanup()
+	}
 	shellenv.ConfigureShellCommand(cmd)
 
 	stdin, err := cmd.StdinPipe()
@@ -146,6 +174,10 @@ func (a *acpxAgent) resolveRawCommand() (string, error) {
 	if !a.NeutralizesGateInstructions() {
 		return a.rawCommand, nil
 	}
+	return a.neutralizedOMPCommand()
+}
+
+func (a *acpxAgent) neutralizedOMPCommand() (string, error) {
 	a.overlayOnce.Do(func() {
 		a.overlayPath, a.overlayErr = writeOMPGateOverlay()
 	})

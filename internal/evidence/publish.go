@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/kunchenguid/no-mistakes/internal/factorysandbox"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 )
@@ -146,6 +147,7 @@ func publishOnce(ctx context.Context, req Request, branch, dir string, files []c
 		return nil, fmt.Errorf("create evidence index: %w", err)
 	}
 	defer os.RemoveAll(indexDir)
+	ctx = factorysandbox.WithGitScratchIndex(ctx, indexDir)
 	env := []string{"GIT_INDEX_FILE=" + filepath.Join(indexDir, "index")}
 
 	if tip != "" {

@@ -19,6 +19,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/custody"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/eval"
+	"github.com/kunchenguid/no-mistakes/internal/factorysandbox"
 	"github.com/kunchenguid/no-mistakes/internal/forgecontext"
 	"github.com/kunchenguid/no-mistakes/internal/gate"
 	"github.com/kunchenguid/no-mistakes/internal/git"
@@ -140,12 +141,39 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	if run == nil || run.Status != types.RunRunning || run.AwaitingAgentSince == nil || run.Branch == "" {
 		return nil, fmt.Errorf("run is not a parked running run")
 	}
+	if controlled, err := m.db.IsFactoryControlledRun(run.ID); err != nil {
+		return nil, err
+	} else if controlled {
+		gate, gateErr := m.db.GetFactoryGate(run.ID)
+		if gateErr != nil {
+			return nil, gateErr
+		}
+		if gate == nil || gate.State != "parked" {
+			return nil, fmt.Errorf("controlled gate is uncertain or unavailable; no recovery dispatch")
+		}
+	}
 	repo, err := m.db.GetRepo(run.RepoID)
 	if err != nil {
 		return nil, fmt.Errorf("get repo: %w", err)
 	}
 	if repo == nil {
 		return nil, fmt.Errorf("run repository is missing")
+	}
+	globalCfg, err := config.LoadGlobal(m.paths.ConfigFile())
+	if err != nil {
+		return nil, err
+	}
+	ctx, controlled, err := lifecycleGitContext(ctx, m.db, m.paths, globalCfg.ControlledExecution, globalCfg.Test.Evidence.LocalRoot, repo, run.ID, worktrees.RecordedDir(m.paths, run.WorktreePath(), repo.ID, run.ID))
+	if err != nil {
+		return nil, err
+	}
+	if controlled {
+		if err := m.db.EnsureFactoryBudget(run); err != nil {
+			return nil, err
+		}
+		if err := validateLifecycleWorktree(m.paths, repo, run, worktrees.RecordedDir(m.paths, run.WorktreePath(), repo.ID, run.ID)); err != nil {
+			return nil, err
+		}
 	}
 	workDir := worktrees.RecordedDir(m.paths, run.WorktreePath(), repo.ID, run.ID)
 	if info, err := os.Stat(workDir); err != nil || !info.IsDir() {
@@ -221,6 +249,17 @@ func (m *RunManager) loadRecoveredConfig(ctx context.Context, run *db.Run, repo 
 	globalCfg, err := config.LoadGlobal(m.paths.ConfigFile())
 	if err != nil {
 		return nil, fmt.Errorf("load global config: %w", err)
+	}
+	var controlled bool
+	ctx, controlled, err = lifecycleGitContext(ctx, m.db, m.paths, globalCfg.ControlledExecution, globalCfg.Test.Evidence.LocalRoot, repo, run.ID, workDir)
+	if err != nil {
+		return nil, err
+	}
+	if controlled {
+		if err := m.db.EnsureFactoryBudget(run); err != nil {
+			return nil, err
+		}
+		globalCfg.ControlledExecution = true
 	}
 	repoCfg, err := config.LoadRepo(workDir)
 	if err != nil {
@@ -404,12 +443,20 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 		return
 	}
 	runCtx, cancel := context.WithCancelCause(context.Background())
+	var err error
+	runCtx, _, err = lifecycleGitContext(runCtx, m.db, m.paths, plan.cfg.ControlledExecution, &plan.cfg.Test.Evidence.LocalRoot, plan.repo, plan.run.ID, plan.workDir)
+	if err != nil {
+		cancel(err)
+		_ = plan.agent.Close()
+		slog.Warn("refusing recovered run without lifecycle policy", "run_id", plan.run.ID, "error", err)
+		return
+	}
 	executor := pipeline.NewExecutor(m.db, m.paths, plan.cfg, plan.agent, plan.steps, m.broadcast)
 	executor.SetOnPRMerged(func(_ context.Context, runID string) {
 		m.wg.Add(1)
 		go func() {
 			defer m.wg.Done()
-			m.relabelEvalRun(context.Background(), plan.cfg, runID)
+			m.relabelEvalRun(context.WithoutCancel(runCtx), plan.cfg, runID)
 		}()
 	})
 	executor.SetForgeContext(plan.forge)
@@ -634,6 +681,10 @@ func (m *RunManager) cleanupRunEvidence(cfg *config.Config, runID string) {
 // execution returned, or which was resumed after a crash all reach this point by
 // different routes. reason distinguishes the routes in the log.
 func (m *RunManager) removeRunWorktree(repoID, runID, gateDir, wtDir, reason string) {
+	if err := validateLifecycleCleanupOwner(m.db, m.paths, repoID, runID, wtDir); err != nil {
+		slog.Warn("preserving unowned worktree without process sweep", "run_id", runID, "path", wtDir, "error", err)
+		return
+	}
 	m.sweepRunWorktreeProcesses(repoID, runID, wtDir)
 	run, err := m.db.GetRun(runID)
 	if err != nil {
@@ -644,7 +695,7 @@ func (m *RunManager) removeRunWorktree(repoID, runID, gateDir, wtDir, reason str
 		slog.Warn("preserving run worktree", "run_id", runID, "path", wtDir, "reason", refusal)
 		return
 	}
-	if err := git.WorktreeRemove(context.Background(), gateDir, wtDir); err != nil {
+	if err := removeLifecycleWorktree(context.Background(), m.db, m.paths, repoID, runID, gateDir, wtDir); err != nil {
 		slog.Warn("failed to remove run worktree", "reason", reason, "run_id", runID, "path", wtDir, "error", err)
 	}
 }
@@ -813,6 +864,28 @@ func (m *RunManager) HandlePushReceived(ctx context.Context, params *ipc.PushRec
 	}
 
 	branch := branchFromRef(params.Ref)
+	globalCfg, err := config.LoadGlobal(m.paths.ConfigFile())
+	if err != nil {
+		enrolled, lookupErr := m.db.FactoryControlledRepoRunID(repo.ID)
+		if lookupErr != nil {
+			return "", lookupErr
+		}
+		if enrolled == "" && params.LaunchNonce == "" {
+			// The ordinary creation path records the configuration failure
+			// before worktree creation. Do not run archive/Git inspection here.
+			return m.startRun(ctx, repo, branch, params.New, params.Old, "push", params.SkipSteps, params.Intent, params.PRBaseBranch, params.OmitIntent, params.VerificationPlanID, params.PiProfile)
+		}
+		return "", fmt.Errorf("load global config: %w", err)
+	}
+	ctx, controlled, err := lifecycleGitContext(ctx, m.db, m.paths, globalCfg.ControlledExecution, globalCfg.Test.Evidence.LocalRoot, repo, "", "")
+	if err != nil {
+		return "", err
+	}
+	if controlled {
+		if err := validateLifecycleLaunch(branch, params.LaunchNonce, params.ValidationGeneration); err != nil {
+			return "", err
+		}
+	}
 	baseSHA := params.Old
 	// A push that re-creates a branch the pusher reconciled reports no previous
 	// head, which would record a zero base and make a deliberate history
@@ -857,6 +930,14 @@ func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch
 		return ipc.LaunchReceipt{}, err
 	}
 	if err := validateValidationGeneration(validationGeneration); err != nil {
+		return ipc.LaunchReceipt{}, err
+	}
+	globalCfg, err := config.LoadGlobal(m.paths.ConfigFile())
+	if err != nil {
+		return ipc.LaunchReceipt{}, err
+	}
+	ctx, _, err = lifecycleGitContext(ctx, m.db, m.paths, globalCfg.ControlledExecution, globalCfg.Test.Evidence.LocalRoot, repo, "", "")
+	if err != nil {
 		return ipc.LaunchReceipt{}, err
 	}
 	storedPRBaseBranch, err := normalizeRunPRBaseBranch(prBaseBranch)
@@ -1076,6 +1157,17 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 	}
 	if repo == nil {
 		return "", fmt.Errorf("unknown repo %s", repoID)
+	}
+	globalCfg, err := config.LoadGlobal(m.paths.ConfigFile())
+	if err != nil {
+		return "", err
+	}
+	ctx, controlled, err := lifecycleGitContext(ctx, m.db, m.paths, globalCfg.ControlledExecution, globalCfg.Test.Evidence.LocalRoot, repo, "", "")
+	if err != nil {
+		return "", err
+	}
+	if controlled {
+		return "", fmt.Errorf("controlled execution requires a fresh strict launch, not a legacy rerun")
 	}
 
 	gateDir := m.paths.RepoDir(repo.ID)
@@ -1325,15 +1417,32 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		trackStartFailure("daemon_shutdown")
 		return "", fmt.Errorf("daemon is shutting down")
 	}
+	globalCfg, globalCfgErr := config.LoadGlobal(m.paths.ConfigFile())
+	if globalCfgErr == nil {
+		var controlled bool
+		var err error
+		ctx, controlled, err = lifecycleGitContext(ctx, m.db, m.paths, globalCfg.ControlledExecution, globalCfg.Test.Evidence.LocalRoot, repo, "", "")
+		if err != nil {
+			return "", err
+		}
+		if controlled {
+			if err := validateLifecycleLaunch(branch, launchNonce, validationGeneration); err != nil {
+				return "", err
+			}
+			globalCfg.ControlledExecution = true
+		}
+	}
 	// Best-effort only: a clone's remotes may change after init. Refresh the
 	// registered URLs before constructing any run-owned Git operation, but keep
 	// the exact prior repo value and continue when discovery, validation, or the
 	// atomic database replacement fails. The reason is deliberately bounded and
 	// URL-free so neither credentials nor sensitive remote material reach logs.
-	if refreshed, _, refreshErr := gate.RefreshRepoURLs(ctx, m.db, repo); refreshErr != nil {
-		slog.Warn("repository URL refresh skipped; continuing with existing registration", "repo_id", repo.ID, "reason", gate.ReasonForRefreshFailure(refreshErr))
-	} else {
-		repo = refreshed
+	if globalCfgErr == nil {
+		if refreshed, _, refreshErr := gate.RefreshRepoURLs(ctx, m.db, repo); refreshErr != nil {
+			slog.Warn("repository URL refresh skipped; continuing with existing registration", "repo_id", repo.ID, "reason", gate.ReasonForRefreshFailure(refreshErr))
+		} else {
+			repo = refreshed
+		}
 	}
 
 	// Resolve before cancellation, row creation or any pipeline work. A bad
@@ -1347,7 +1456,6 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 	// stamp back instead of a since-changed config file. Legacy launches keep
 	// their failed-row diagnostics on a bad global config: the load error is
 	// held until the row exists.
-	globalCfg, globalCfgErr := config.LoadGlobal(m.paths.ConfigFile())
 	var pin *agentcfg.PiProfile
 	if request := agentcfg.OptionalPiProfile(profiles); request != nil {
 		if globalCfgErr != nil {
@@ -1416,6 +1524,12 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		trackStartFailure("create_run")
 		return "", fmt.Errorf("create run: %w", err)
 	}
+	if globalCfg != nil && globalCfg.ControlledExecution {
+		if err := m.db.EnsureFactoryBudget(run); err != nil {
+			m.db.UpdateRunError(run.ID, err.Error())
+			return "", err
+		}
+	}
 	if inherited := strings.TrimSpace(inheritedPRURL); inherited != "" {
 		if err := m.db.UpdateRunPRURL(run.ID, inherited); err != nil {
 			m.db.UpdateRunError(run.ID, fmt.Sprintf("inherit PR URL: %s", err))
@@ -1458,9 +1572,23 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		trackStartFailure("record_worktree_placement")
 		return "", fmt.Errorf("record worktree placement: %w", err)
 	}
-	if err := git.WorktreeAdd(ctx, gateDir, wtDir, headSHA); err != nil {
+	addCtx := ctx
+	if globalCfg.ControlledExecution {
+		ctx, _, err = lifecycleGitContext(ctx, m.db, m.paths, globalCfg.ControlledExecution, globalCfg.Test.Evidence.LocalRoot, repo, run.ID, "")
+		if err != nil {
+			return "", err
+		}
+		if err := createLifecycleWorktreeDestination(wtDir); err != nil {
+			return "", err
+		}
+		addCtx = factorysandbox.WithGitWorktreeDestination(ctx, wtDir)
+	}
+	if err := git.WorktreeAdd(addCtx, gateDir, wtDir, headSHA); err != nil {
 		m.db.UpdateRunError(run.ID, fmt.Sprintf("create worktree: %s", err))
 		trackStartFailure("create_worktree")
+		if globalCfg.ControlledExecution {
+			_ = os.Remove(wtDir) // only the still-empty directory we created
+		}
 		return "", fmt.Errorf("create worktree: %w", err)
 	}
 
@@ -1475,6 +1603,12 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 			m.removeRunWorktree(repo.ID, run.ID, gateDir, wtDir, "run_setup_failed")
 		}
 	}()
+	if globalCfg.ControlledExecution {
+		ctx, _, err = lifecycleGitContext(ctx, m.db, m.paths, globalCfg.ControlledExecution, globalCfg.Test.Evidence.LocalRoot, repo, run.ID, wtDir)
+		if err != nil {
+			return "", err
+		}
+	}
 
 	if err := git.CopyLocalUserIdentity(ctx, repo.WorkingPath, wtDir); err != nil {
 		m.db.UpdateRunError(run.ID, fmt.Sprintf("configure worktree git identity: %s", err))
@@ -1618,6 +1752,12 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 
 	// Create executor with event broadcast.
 	runCtx, cancel := context.WithCancelCause(context.Background())
+	runCtx, _, err = lifecycleGitContext(runCtx, m.db, m.paths, cfg.ControlledExecution, &cfg.Test.Evidence.LocalRoot, repo, run.ID, wtDir)
+	if err != nil {
+		cancel(err)
+		_ = ag.Close()
+		return "", err
+	}
 	executor := pipeline.NewExecutor(m.db, m.paths, cfg, ag, execSteps, m.broadcast)
 	executor.SetForgeContext(forgeCtx)
 	executor.SetSkippedSteps(skipSteps)
@@ -1625,7 +1765,7 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		m.wg.Add(1)
 		go func() {
 			defer m.wg.Done()
-			m.relabelEvalRun(context.Background(), cfg, runID)
+			m.relabelEvalRun(context.WithoutCancel(runCtx), cfg, runID)
 		}()
 	})
 
@@ -1667,7 +1807,7 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 				}
 				addRunPerformanceSummary(m.db, run.ID, fields)
 				telemetry.Track("run", fields)
-				verifiedHead, verified := preserveRunHead(m.db, wtDir, run)
+				verifiedHead, verified := preserveRunHead(m.db, m.paths, cfg, wtDir, run)
 				var dbErr error
 				if verified {
 					dbErr = m.db.UpdateRunErrorStatusWithVerifiedHead(run.ID, errMsg, types.RunFailed, verifiedHead)
@@ -1913,6 +2053,11 @@ func (m *RunManager) HandleRespond(runID string, step types.StepName, action typ
 // HandleRespondWithOverrides is like HandleRespond but also forwards user
 // instructions and user-authored findings to the executor.
 func (m *RunManager) HandleRespondWithOverrides(runID string, step types.StepName, action types.ApprovalAction, findingIDs []string, instructions map[string]string, addedFindings []types.Finding, approvalReason string) error {
+	if controlled, err := m.db.IsFactoryControlledRun(runID); err != nil {
+		return err
+	} else if controlled {
+		return fmt.Errorf("controlled run requires factory_respond")
+	}
 	m.mu.Lock()
 	exec, ok := m.executors[runID]
 	m.mu.Unlock()
@@ -1922,6 +2067,32 @@ func (m *RunManager) HandleRespondWithOverrides(runID string, step types.StepNam
 	}
 
 	return exec.RespondWithOverrides(step, action, findingIDs, instructions, addedFindings, approvalReason)
+}
+
+// HandleFactoryRespond permits durable replay even after the executor exits.
+func (m *RunManager) HandleFactoryRespond(q db.FactoryResponseRequest) (*db.FactoryResponseReceipt, error) {
+	controlled, err := m.db.IsFactoryControlledRun(q.RunID)
+	if err != nil {
+		return nil, err
+	}
+	if !controlled {
+		return nil, fmt.Errorf("strict response requires a controlled run")
+	}
+	existing, err := m.db.GetFactoryResponseReceipt(q.RunID, q.OperationID)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil {
+		receipt, _, claimErr := m.db.ClaimFactoryResponse(q)
+		return receipt, claimErr
+	}
+	m.mu.Lock()
+	exec := m.executors[q.RunID]
+	m.mu.Unlock()
+	if exec == nil {
+		return nil, fmt.Errorf("no active executor for run %s", q.RunID)
+	}
+	return exec.RespondFactory(q)
 }
 
 // HandleAnswerReviewQuestion records one operator answer to a question the
@@ -1954,6 +2125,11 @@ func (m *RunManager) HandleRespondWithOverrides(runID string, step types.StepNam
 // The write happens before the release decision, so a failure to resume never
 // loses the answer - the next answer, or a recovered gate, finds it on disk.
 func (m *RunManager) HandleAnswerReviewQuestion(runID, questionID, answer, answeredBy string) (*ipc.AnswerReviewQuestionResult, error) {
+	if controlled, err := m.db.IsFactoryControlledRun(runID); err != nil {
+		return nil, err
+	} else if controlled {
+		return nil, fmt.Errorf("legacy review answer cannot release a controlled gate")
+	}
 	questionID = strings.TrimSpace(questionID)
 	answer = strings.TrimSpace(answer)
 	if questionID == "" || answer == "" {
@@ -2091,6 +2267,9 @@ func (m *RunManager) Shutdown() {
 	m.mu.Unlock()
 
 	for id, cancel := range cancels {
+		if err := m.db.FenceFactoryRun(id); err != nil {
+			slog.Error("persist stop fence", "run_id", id, "error", err)
+		}
 		cancel(fmt.Errorf("daemon shutting down"))
 		slog.Info("cancelled run on shutdown", "run_id", id)
 	}
@@ -2114,11 +2293,49 @@ func (m *RunManager) HandleCancel(runID string) error {
 	m.mu.Unlock()
 
 	if !ok {
+		if settled, err := m.cancelUncertainFactoryRun(runID, types.RunCancelReasonAbortedByUser); err != nil {
+			return err
+		} else if settled {
+			return nil
+		}
 		return fmt.Errorf("no active run %s", runID)
 	}
 
+	if err := m.db.FenceFactoryRun(runID); err != nil {
+		return err
+	}
 	cancel(fmt.Errorf(types.RunCancelReasonAbortedByUser))
 	return nil
+}
+
+// An uncertain crash park deliberately has no executor. Cancellation settles
+// its run row but preserves both the receipt and worktree for inspection.
+func (m *RunManager) cancelUncertainFactoryRun(runID, reason string) (bool, error) {
+	controlled, err := m.db.IsFactoryControlledRun(runID)
+	if err != nil || !controlled {
+		return false, err
+	}
+	gate, err := m.db.GetFactoryGate(runID)
+	if err != nil {
+		return false, err
+	}
+	if gate == nil || gate.State != "uncertain" {
+		return false, nil
+	}
+	run, err := m.db.GetRun(runID)
+	if err != nil {
+		return false, err
+	}
+	if run == nil || run.Status != types.RunRunning {
+		return false, nil
+	}
+	if err = m.db.FenceFactoryRun(runID); err != nil {
+		return false, err
+	}
+	if err = m.db.UpdateRunErrorStatus(runID, reason, types.RunCancelled); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // cancelActiveRuns cancels any in-progress runs for the given repo+branch
@@ -2147,9 +2364,17 @@ func (m *RunManager) cancelActiveRuns(repoID, branch string) {
 		done := m.dones[run.ID]
 		m.mu.Unlock()
 		if !ok {
+			if _, err := m.cancelUncertainFactoryRun(run.ID, types.RunCancelReasonSuperseded); err != nil {
+				slog.Error("cancel uncertain controlled run", "run_id", run.ID, "error", err)
+			}
 			continue
 		}
 
+		if err := m.db.FenceFactoryRun(run.ID); err != nil {
+			slog.Error("persist supersession fence", "run_id", run.ID, "error", err)
+			cancel(fmt.Errorf("stop fence failed: %w", err))
+			continue
+		}
 		cancel(fmt.Errorf(types.RunCancelReasonSuperseded))
 		slog.Info("cancelled active run", "run_id", run.ID, "repo_id", repoID, "branch", branch)
 		if done != nil {

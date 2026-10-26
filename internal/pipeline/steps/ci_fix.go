@@ -109,6 +109,9 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 		return ciRepairParkOutcome(targets.Findings, sctx.DeferredFindings, err.Error()), nil
 	}
 	if err != nil {
+		if sctx.Config.ControlledExecution {
+			return ciRepairParkOutcome(targets.Findings, sctx.DeferredFindings, "Controlled repair failed or has uncertain effects; automatic replay is prohibited: "+err.Error()), nil
+		}
 		// An ordinary fix failure is cheap to repeat and often works the next
 		// time: the next settled observation re-emits the findings and the
 		// executor retries while auto_fix.ci allows.
@@ -253,10 +256,11 @@ CI logs:
 
 	sctx.Log("running agent to fix CI issues...")
 	result, err := sctx.RunAgentContext(ctx, agent.RunOpts{
-		Prompt:     prompt,
-		CWD:        sctx.WorkDir,
-		JSONSchema: ciFixConclusionSchema,
-		OnChunk:    sctx.LogChunk,
+		FactoryMutation: sctx.Config.ControlledExecution,
+		Prompt:          prompt,
+		CWD:             sctx.WorkDir,
+		JSONSchema:      ciFixConclusionSchema,
+		OnChunk:         sctx.LogChunk,
 	})
 	if err != nil {
 		return ciRepairResult{}, fmt.Errorf("agent CI fix: %w", err)
@@ -572,6 +576,14 @@ func (s *CIStep) retryProtectedPathRepair(sctx *pipeline.StepContext) (ciRepairR
 }
 
 func (s *CIStep) commitRepair(sctx *pipeline.StepContext, summary string) (ciRepairResult, error) {
+	if sctx.Config != nil && sctx.Config.ControlledExecution {
+		if sctx.DB == nil || sctx.Run == nil {
+			return ciRepairResult{}, errors.New("controlled CI commit requires enrolled repair")
+		}
+		if err := sctx.DB.ValidateFactoryRepair(sctx.FactoryRepairID, sctx.Run.ID, sctx.StepResultID); err != nil {
+			return ciRepairResult{}, err
+		}
+	}
 	status, err := stepGitRun(sctx, "status", "--porcelain")
 	if err != nil {
 		return ciRepairResult{}, fmt.Errorf("check CI changes: %w", err)

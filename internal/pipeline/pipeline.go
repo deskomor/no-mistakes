@@ -15,6 +15,9 @@ var ErrFatalGateReconciliation = errors.New("fatal gate reconciliation")
 
 // StepContext provides shared resources to pipeline steps during execution.
 type StepContext struct {
+	// FactoryRepairID is a durable reservation belonging to this run/step.
+	// Its presence alone never authorizes assessment turns to write.
+	FactoryRepairID  string
 	Ctx              context.Context
 	Run              *db.Run
 	Repo             *db.Repo

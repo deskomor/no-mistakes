@@ -86,6 +86,9 @@ var housekeepingFindingsSchema = json.RawMessage(`{
 }`)
 
 func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	if controlledAssessment(sctx) {
+		return factoryAssessHousekeeping(sctx, s.Name())
+	}
 	if err := assertPipelineHeadContinuity(sctx, s.Name()); err != nil {
 		return nil, err
 	}
@@ -135,11 +138,12 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 	}
 
 	result, err := sctx.RunAgentContext(ctx, agent.RunOpts{
-		Prompt:     prompt,
-		CWD:        sctx.WorkDir,
-		JSONSchema: schema,
-		OnChunk:    sctx.LogChunk,
-		Purpose:    purpose,
+		FactoryMutation: sctx.Config.ControlledExecution && sctx.Fixing,
+		Prompt:          prompt,
+		CWD:             sctx.WorkDir,
+		JSONSchema:      schema,
+		OnChunk:         sctx.LogChunk,
+		Purpose:         purpose,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("agent document: %w", err)

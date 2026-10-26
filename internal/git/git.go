@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kunchenguid/no-mistakes/internal/factorysandbox"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 	"github.com/kunchenguid/no-mistakes/internal/winproc"
@@ -112,6 +113,11 @@ func runInDirWithEnvAndInputRaw(ctx context.Context, dir string, extraEnv []stri
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	shellenv.ConfigureShellCommand(cmd)
+	cleanup, err := factorysandbox.WrapGitCommand(ctx, cmd, args)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
 	out, err := shellenv.OutputShellCommand(cmd)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -203,6 +209,11 @@ func InitBare(ctx context.Context, path string) error {
 	cmd := exec.CommandContext(ctx, "git", "init", "--bare", path)
 	cmd.Env = nonInteractiveEnvForContext(ctx, "")
 	winproc.Harden(cmd)
+	cleanup, err := factorysandbox.WrapGitCommand(ctx, cmd, cmd.Args[1:])
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git init --bare: %w: %s", err, strings.TrimSpace(string(out)))
@@ -470,6 +481,11 @@ func IsDetachedHEAD(ctx context.Context, dir string) (bool, error) {
 	cmd := exec.CommandContext(ctx, "git", "symbolic-ref", "-q", "HEAD")
 	cmd.Dir = dir
 	winproc.Harden(cmd)
+	cleanup, err := factorysandbox.WrapGitCommand(ctx, cmd, cmd.Args[1:])
+	if err != nil {
+		return false, err
+	}
+	defer cleanup()
 	if err := cmd.Run(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			// Exit 1 means HEAD is not a symbolic ref — detached.
@@ -834,6 +850,11 @@ func RefExists(ctx context.Context, dir, ref string) (bool, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
 	cmd.Env = nonInteractiveEnvForContext(ctx, dir)
 	winproc.Harden(cmd)
+	cleanup, err := factorysandbox.WrapGitCommand(ctx, cmd, cmd.Args[1:])
+	if err != nil {
+		return false, err
+	}
+	defer cleanup()
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) && ee.ExitCode() == 1 {

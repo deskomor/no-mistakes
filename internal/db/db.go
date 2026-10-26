@@ -30,7 +30,7 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	sqlDB.SetMaxOpenConns(1)
-	if _, err := sqlDB.Exec(schemaSQL); err != nil {
+	if _, err := sqlDB.Exec(schemaSQL + factoryBudgetSchema + factoryResponseSchema); err != nil {
 		sqlDB.Close()
 		return nil, fmt.Errorf("migrate db: %w", err)
 	}

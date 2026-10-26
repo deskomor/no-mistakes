@@ -441,6 +441,10 @@ func rebaseWithAgent(ctx context.Context, sctx *pipeline.StepContext, targetRef 
 		_, _ = git.Run(ctx, sctx.WorkDir, "rebase", "--abort")
 		return fmt.Errorf("rebase onto %s failed (no conflicts detected)", targetRef)
 	}
+	if sctx.Config != nil && sctx.Config.ControlledExecution && (!sctx.Fixing || sctx.FactoryRepairID == "") {
+		_, _ = git.Run(ctx, sctx.WorkDir, "rebase", "--abort")
+		return fmt.Errorf("rebase conflicts require a reserved repair pass")
+	}
 	sctx.Log("conflicts detected, asking agent to resolve...")
 	conflictFiles := rebaseConflictFiles(ctx, sctx.WorkDir)
 
@@ -471,10 +475,11 @@ Instructions:
 	prompt = testguidance.LateRepairPrompt(string(types.StepRebase), prompt)
 
 	_, err = sctx.RunAgentContext(ctx, agent.RunOpts{
-		Prompt:     prompt,
-		CWD:        sctx.WorkDir,
-		JSONSchema: commitSummarySchema,
-		OnChunk:    sctx.LogChunk,
+		FactoryMutation: sctx.Config != nil && sctx.Config.ControlledExecution && sctx.Fixing && sctx.FactoryRepairID != "",
+		Prompt:          prompt,
+		CWD:             sctx.WorkDir,
+		JSONSchema:      commitSummarySchema,
+		OnChunk:         sctx.LogChunk,
 	})
 	if err != nil {
 		_, _ = git.Run(ctx, sctx.WorkDir, "rebase", "--abort")
@@ -584,6 +589,10 @@ func mergeWithAgent(ctx context.Context, sctx *pipeline.StepContext, targetRef s
 		_, _ = git.Run(ctx, sctx.WorkDir, "merge", "--abort")
 		return fmt.Errorf("merge %s failed (no conflicts detected)", targetRef)
 	}
+	if sctx.Config != nil && sctx.Config.ControlledExecution && (!sctx.Fixing || sctx.FactoryRepairID == "") {
+		_, _ = git.Run(ctx, sctx.WorkDir, "merge", "--abort")
+		return fmt.Errorf("merge conflicts require a reserved repair pass")
+	}
 	sctx.Log("conflicts detected, asking agent to resolve...")
 
 	prompt := fmt.Sprintf(
@@ -614,10 +623,11 @@ Instructions:
 	prompt = testguidance.LateRepairPrompt(string(types.StepRebase), prompt)
 
 	_, err = sctx.RunAgentContext(ctx, agent.RunOpts{
-		Prompt:     prompt,
-		CWD:        sctx.WorkDir,
-		JSONSchema: commitSummarySchema,
-		OnChunk:    sctx.LogChunk,
+		FactoryMutation: sctx.Config != nil && sctx.Config.ControlledExecution && sctx.Fixing && sctx.FactoryRepairID != "",
+		Prompt:          prompt,
+		CWD:             sctx.WorkDir,
+		JSONSchema:      commitSummarySchema,
+		OnChunk:         sctx.LogChunk,
 	})
 	if err != nil {
 		_, _ = git.Run(ctx, sctx.WorkDir, "merge", "--abort")

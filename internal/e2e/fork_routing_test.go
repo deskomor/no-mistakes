@@ -94,6 +94,59 @@ func TestForkRouting(t *testing.T) {
 	}
 }
 
+// A shared XDG git/config must never receive rewrites or let an earlier
+// fixture capture the next fixture's identical forge URL. Changing XDG for
+// provider discovery must also leave the fixture's Git config reachable.
+func TestHarnessGitURLRewriteIsolation(t *testing.T) {
+	ambient := t.TempDir()
+	ambientXDG := filepath.Join(ambient, "xdg")
+	if err := os.MkdirAll(filepath.Join(ambientXDG, "git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := []byte("[user]\n\tname = ambient sentinel\n")
+	ambientConfig := filepath.Join(ambientXDG, "git", "config")
+	if err := os.WriteFile(ambientConfig, sentinel, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", ambientXDG)
+	t.Setenv("GIT_CONFIG_GLOBAL", ambientConfig)
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "url.file:///missing-ambient-repo.insteadOf")
+	t.Setenv("GIT_CONFIG_VALUE_0", "https://github.com/parent-owner/no-mistakes.git")
+	t.Setenv("GIT_CONFIG_PARAMETERS", "'protocol.file.allow'='never'")
+	t.Setenv("GIT_ALLOW_PROTOCOL", "file")
+
+	for _, name := range []string{"first", "second"} {
+		t.Run(name, func(t *testing.T) {
+			h := NewHarness(t, SetupOpts{Agent: "claude"})
+			ctx := context.Background()
+			mainSHA, err := h.runGit(ctx, h.WorkDir, "rev-parse", "refs/heads/main")
+			if err != nil {
+				t.Fatalf("resolve fixture main: %v\n%s", err, mainSHA)
+			}
+			upstreamSHA, err := h.runGit(ctx, h.WorkDir, "ls-remote", h.UpstreamDir, "refs/heads/main")
+			if err != nil || !strings.HasPrefix(string(upstreamSHA), strings.TrimSpace(string(mainSHA))+"\t") {
+				t.Fatalf("fixture upstream main: %v\n%s", err, upstreamSHA)
+			}
+			const remoteURL = "https://github.com/parent-owner/no-mistakes.git"
+			configureGitURLRewrite(t, h, remoteURL, h.UpstreamDir)
+			// Gitea selects its provider config after setting up the rewrite.
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(h.HomeDir, "provider-config"))
+			remoteSHA, err := h.runGit(ctx, h.WorkDir, "ls-remote", remoteURL, "refs/heads/main")
+			if err != nil || string(remoteSHA) != string(upstreamSHA) {
+				t.Fatalf("rewritten main: %v\n%s; want %s", err, remoteSHA, upstreamSHA)
+			}
+		})
+	}
+	data, err := os.ReadFile(ambientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, sentinel) {
+		t.Fatalf("harness changed ambient Git config:\n%s", data)
+	}
+}
+
 func configureGitURLRewrite(t *testing.T, h *Harness, rawURL, repoDir string) {
 	t.Helper()
 	rewrite := pathFileURL(t, repoDir)

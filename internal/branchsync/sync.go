@@ -14,6 +14,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/custody"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/factorysandbox"
 	"github.com/kunchenguid/no-mistakes/internal/gatecontext"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
@@ -178,6 +179,51 @@ type Service struct {
 	afterRecoverBranchMove            func()
 }
 
+func (s *Service) controlledContext(ctx context.Context) (context.Context, *State) {
+	policyCtx, err := s.GitContext(ctx)
+	if err != nil {
+		return ctx, &State{State: StateAmbiguousContext, Safety: "blocked_controlled_context", Error: fmt.Sprintf("could not establish controlled Git custody: %v", err)}
+	}
+	return policyCtx, nil
+}
+
+// GitContext establishes custody before the first Git inspection or launch.
+// Previously admitted repairs may have changed executable repository settings;
+// disabling today's opt-in must not forget durable checkout enrollment.
+func (s *Service) GitContext(ctx context.Context) (context.Context, error) {
+	if s.DB == nil || s.Repo == nil {
+		return ctx, fmt.Errorf("registered repository database is unavailable")
+	}
+	runID, err := s.DB.FactoryControlledRepoRunID(s.Repo.ID)
+	if err != nil {
+		return ctx, err
+	}
+	if runID == "" {
+		return ctx, nil
+	}
+	p := s.Paths
+	if p == nil {
+		p, err = paths.ForGate(s.GateDir)
+		if err != nil {
+			return ctx, err
+		}
+	}
+	protected := []string{s.workDir(), s.Repo.WorkingPath}
+	if s.GateDir != "" {
+		if _, err := os.Stat(s.GateDir); err == nil {
+			protected = append(protected, s.GateDir)
+		} else if !os.IsNotExist(err) {
+			return ctx, err
+		}
+	}
+	// Registration, not mutable Git remotes, defines exact private mirrors.
+	protected, err = factorysandbox.IncludeLocalMirrors(protected, s.Repo.UpstreamURL, s.Repo.ForkURL)
+	if err != nil {
+		return ctx, err
+	}
+	return factorysandbox.WithPolicy(ctx, p.RunEvidenceDir("", runID), protected), nil
+}
+
 // remoteTimeout returns the bounded deadline budget for one remote
 // operation: the configured RemoteTimeout when set, otherwise the package
 // default.
@@ -276,6 +322,10 @@ func displayTarget(raw string) string {
 // ancestry evidence without fetching or mutating refs, the index, or the
 // worktree.
 func (s *Service) InspectCached(ctx context.Context) State {
+	ctx, refusal := s.controlledContext(ctx)
+	if refusal != nil {
+		return *refusal
+	}
 	state, _, _ := s.inspect(ctx)
 	return state
 }
@@ -283,6 +333,10 @@ func (s *Service) InspectCached(ctx context.Context) State {
 // Refresh explicitly verifies the exact configured push ref into a private
 // no-mistakes ref. It never updates an ordinary remote-tracking ref.
 func (s *Service) Refresh(ctx context.Context) State {
+	ctx, refusal := s.controlledContext(ctx)
+	if refusal != nil {
+		return *refusal
+	}
 	state, run, ok := s.inspect(ctx)
 	if !ok || !refreshable(state) {
 		return state
@@ -417,6 +471,10 @@ func (s *Service) gateContextRefusal(ctx context.Context) (State, bool) {
 // use a strict fast-forward. Equivalent-diverged branches first anchor the
 // pre-sync head, then move to the verified equivalent pipeline head.
 func (s *Service) Apply(ctx context.Context) State {
+	ctx, refusal := s.controlledContext(ctx)
+	if refusal != nil {
+		return *refusal
+	}
 	if refusal, blocked := s.gateContextRefusal(ctx); blocked {
 		return refusal
 	}
@@ -516,6 +574,10 @@ func (s *Service) Apply(ctx context.Context) State {
 // recovery where the clean worktree remains at an exact submitted, reviewed,
 // or successfully pushed head and the archived later head is divergent.
 func (s *Service) BindRecoveryArchive(ctx context.Context, archiveRef string) State {
+	ctx, refusal := s.controlledContext(ctx)
+	if refusal != nil {
+		return *refusal
+	}
 	if refusal, blocked := s.gateContextRefusal(ctx); blocked {
 		return refusal
 	}
@@ -653,6 +715,10 @@ func (s *Service) BindRecoveryArchive(ctx context.Context, archiveRef string) St
 // or the ordinary classification against the last push binding (pushed runs),
 // both pointing at run_pipeline as the next step.
 func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
+	ctx, refusal := s.controlledContext(ctx)
+	if refusal != nil {
+		return *refusal
+	}
 	if refusal, blocked := s.gateContextRefusal(ctx); blocked {
 		return refusal
 	}
@@ -1376,6 +1442,10 @@ func (s *Service) finishKeepLocalRecover(ctx context.Context, state State, runID
 // the worktree. The gate update is a compare-and-swap, so a concurrent lane
 // update wins rather than being overwritten.
 func (s *Service) AdoptPublished(ctx context.Context) State {
+	ctx, refusal := s.controlledContext(ctx)
+	if refusal != nil {
+		return *refusal
+	}
 	if refusal, blocked := s.gateContextRefusal(ctx); blocked {
 		return refusal
 	}

@@ -141,6 +141,16 @@ func NewHarness(t *testing.T, opts SetupOpts) *Harness {
 	t.Setenv("PATH", h.BinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("HOME", h.HomeDir)
 	t.Setenv("NM_HOME", h.NMHome)
+	// HOME alone does not isolate Git: when ~/.gitconfig is absent, --global
+	// can write an existing $XDG_CONFIG_HOME/git/config. Pin the Git file
+	// separately so provider tests can change XDG without losing URL rewrites.
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h.HomeDir, ".config"))
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(h.HomeDir, ".gitconfig"))
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	// Agent runners can inject Git configuration independently of those files.
+	// Tests that exercise injection must opt in after creating their harness.
+	t.Setenv("GIT_CONFIG_COUNT", "0")
+	t.Setenv("GIT_CONFIG_PARAMETERS", "")
 	t.Setenv("FAKEAGENT_LOG", h.AgentLog)
 	if h.Scenario != "" {
 		t.Setenv("FAKEAGENT_SCENARIO", h.Scenario)

@@ -16,6 +16,9 @@ type LintStep struct{}
 func (s *LintStep) Name() types.StepName { return types.StepLint }
 
 func (s *LintStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	if controlledAssessment(sctx) && sctx.Config.Commands.Lint == "" {
+		return factoryAssessHousekeeping(sctx, s.Name())
+	}
 	if err := assertPipelineHeadContinuity(sctx, s.Name()); err != nil {
 		return nil, err
 	}
@@ -73,11 +76,12 @@ Previous lint findings to address:
 ` + sanitizedPreviousFindingsForPrompt(sctx.PreviousFindings)
 		}
 		result, err := sctx.RunAgentContext(ctx, agent.RunOpts{
-			Prompt:     fixerPrompt(prompt),
-			CWD:        sctx.WorkDir,
-			JSONSchema: findingsSchema,
-			OnChunk:    sctx.LogChunk,
-			Purpose:    "lint",
+			FactoryMutation: sctx.Config.ControlledExecution && sctx.Fixing,
+			Prompt:          fixerPrompt(prompt),
+			CWD:             sctx.WorkDir,
+			JSONSchema:      findingsSchema,
+			OnChunk:         sctx.LogChunk,
+			Purpose:         "lint",
 		})
 		if err != nil {
 			return nil, fmt.Errorf("agent lint: %w", err)

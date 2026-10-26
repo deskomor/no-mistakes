@@ -236,6 +236,18 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		return emitError(cmd, 1, err.Error(), repoInitHelp(err)...)
 	}
 	defer env.close()
+	// A prior controlled repair can leave executable settings in this
+	// checkout or gate. Protect reattachment and replacement-nonce launches
+	// from durable enrollment before even their first Git proof.
+	policy := &branchsync.Service{DB: env.d, Repo: env.repo, WorkDir: ".", GateDir: env.p.RepoDir(env.repo.ID), Paths: env.p}
+	ctx, err = policy.GitContext(ctx)
+	if err != nil {
+		return emitError(cmd, 1, fmt.Sprintf("establish controlled Git custody: %v", err))
+	}
+	driveCtx, err = policy.GitContext(driveCtx)
+	if err != nil {
+		return emitError(cmd, 1, fmt.Sprintf("establish controlled Git custody: %v", err))
+	}
 	// Probe before any RPC carries omit_intent: an older daemon would drop
 	// the unknown field silently and publish the intent it was asked to
 	// withhold, so the run is refused instead. An unreadable global config

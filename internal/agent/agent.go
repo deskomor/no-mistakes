@@ -33,7 +33,13 @@ type Agent interface {
 
 // RunOpts configures a single agent invocation.
 type RunOpts struct {
-	Prompt string
+	// FactoryControlled requires the enforced Linux execution boundary.
+	FactoryControlled bool
+	// FactoryMutation marks one durably authorized repair dispatch, not assessment.
+	FactoryMutation       bool
+	FactoryEvidenceDir    string
+	FactoryProtectedPaths []string
+	Prompt                string
 	// Env appends invocation-scoped environment entries to the agent process.
 	// Entries later in the slice override inherited values.
 	Env         []string

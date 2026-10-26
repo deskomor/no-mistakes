@@ -3,6 +3,63 @@ title: CLI Commands
 description: Complete reference for all no-mistakes commands and flags.
 ---
 
+## Controlled Factory responses
+
+With machine-global `controlled_execution: true`, gate responses use a distinct protocol. Legacy `axi respond`, review answers, TUI responses, and automatic reconciliation cannot release a controlled gate. Ordinary opt-out runs retain their existing behavior.
+
+Controlled mode requires `review.conversation: false` (the default). Enrollment rejects an enabled review conversation before steps start because review answers do not carry strict operation identities. Ordinary ask-user findings remain supported through exact strict responses. Opt-out runs keep upstream review conversations.
+
+These commands emit JSON and require exact durable run identities:
+
+```sh
+no-mistakes axi factory-gate --run RUN_ID
+no-mistakes axi factory-respond --request response.json
+no-mistakes axi factory-receipt --run RUN_ID --operation OPERATION_ID
+no-mistakes axi factory-budget --run RUN_ID
+```
+
+`factory-gate` and `factory-receipt` read the database without starting a daemon or requiring a repository checkout; they also work for terminal runs. An absent record is JSON `null`. `factory-respond` requires an already-running daemon and never falls back to the legacy response method when the daemon lacks strict support.
+
+A request contains `run_id`, `operation_id`, `expected_gate` (the complete object returned by `factory-gate`), and `payload`. The payload has `step`, `action` (`approve`, `fix`, `skip`, or `abort`), and optional `finding_ids`, `instructions`, `added_findings`, and Test-only `approval_reason`. The CLI computes the canonical payload digest; an optional supplied `payload_digest` must match it. Receipts always include that digest. Persist the exact request and operation ID before submission; do not regenerate them after an acknowledgement is lost. `--request -` reads stdin.
+
+For `fix` on a gate with existing findings, `finding_ids` must explicitly select the findings being authorized, including when adding further findings. Omitting the selection is rejected before any receipt or repair reservation: Review needs those IDs to clear its outstanding set after positive verification, and an implicit whole-gate fix can otherwise waste the repair allowance while leaving old findings parked.
+
+Gate identity includes run, step-result, round, monotonic park generation, opaque gate ID, and full head SHA. A replaced same-step gate or changed head rejects the old identity. One operation ID binds permanently to its original gate and payload digest. An identical replay returns its durable receipt even after the gate moves or the run finishes, without redispatch. A conflicting request rejects.
+
+Before a new admission, the executor also checks the actual worktree head and requires a clean index and worktree, including no untracked files. Unknown or duplicate finding selections and instruction targets reject before consuming an operation or gate. Only `fix` accepts finding selections and overrides. Stop a dirty run through `axi abort`; inspect its modifications rather than approving them through a stale gate.
+
+Receipts report `accepted`, `started`, `completed`, or `uncertain`. `started` is persisted before enqueue; `completed` means the response's processing reached the next park or ended, not that validation succeeded. Inspect run status separately. Stop and response admission share database ordering: stop-first rejects admission, and stop before start prevents dispatch. A claim already started before stop may have external effects before cancellation.
+
+After an unclean restart, accepted or started operations become `uncertain`; their runs remain parked without an executor, and neither a response replay nor automatic reconciliation starts them again. Inspect the receipt and actual repository/external state before explicitly starting a replacement validation run. This provides at-most-once admission and dispatch, not exactly-once arbitrary filesystem or remote effects.
+
+`factory-budget` reports the durable shared allowance (`limit`, `used`, and `remaining`) for the run's enrolled generation, without starting a daemon. A reservation is spent before repair dispatch and is not refunded after failure or uncertainty. A new validation nonce or replacement run in the same generation does not replenish it. Keep the caller's canonical validator checkout, branch, and card-execution generation stable across revalidation; a different identity is a different budget, not a safe retry.
+
+## Controlled Factory credential host
+
+`axi factory-auth` owns one foreground Linux credential host for one isolated agent directory. It uses the official omp `auth-gateway stdio` interface, minimum **18.12.3**, with the selected user's existing stored logins, models and extension providers. It never copies provider credentials or user configuration into the consumer.
+
+```sh
+# The controller must supply stdin as an open pipe or local Unix stream socket.
+no-mistakes axi factory-auth \
+  --omp /path/to/omp \
+  --source-home "$HOME" \
+  --source-agent-dir "$HOME/.omp/agent" \
+  --runtime-dir /path/to/private/card-agent \
+  --model provider/model
+```
+
+All flags are required. Paths must be clean absolute paths without symlink components. The omp executable must be a regular executable file with one hard link. The runtime must be empty apart from an existing safe ownership lock, current-user-owned, mode `0700`, outside the selected source agent and source `.omp`/`.config` trees, and must not contain a source path. Competing owners, retained agent state and unsafe locks are refused without adoption or deletion.
+
+The credential subprocess runs from a private neutral directory, never the card checkout. Bubblewrap exposes only explicit system/network-runtime files and approved read-only source paths; it supplies private `/run`, temporary directories and writable scratch, not the host root or its service sockets. Ambient provider keys, configuration/model selectors, broker overrides and injected loader options are not inherited. Sources needing environment credentials, unmounted helper runtimes, SQLite migration, credential refresh or other source writes can fail; no writable-source or credential-copy fallback is attempted.
+
+One JSON readiness line reports `ready`, owner `pid`, managed `model`, original `source_model`, `runtime_dir` and omp `version`; it contains no bearer. Owned `models.yml` and `config.yml` configure the consumer's `PI_CODING_AGENT_DIR`. They contain a newly generated per-card gateway bearer, not a provider key. The listener binds ephemeral IPv4 loopback, authenticates before parsing or forwarding, exposes only its scoped model list and Chat Completions route, and pins requests and replies to the selected source model. Source and consumer model fallback are disabled.
+
+Limits are four concurrent inference requests, an 8 MiB HTTP request body, a 32 MiB stdio frame and four minutes per inference request. The official stdio protocol buffers streamed replies until completion. Its lack of per-request cancellation means a cancelled inference terminates this card's credential host, not another card's host. Pricing and reasoning metadata are omitted because the source catalog does not provide them; consumer defaults are not measured source prices or supported effort settings.
+
+Keep controlling stdin open throughout ownership. EOF, a read error, SIGINT or SIGTERM stops the owner, reaps the credential subprocess and releases the runtime lock; the controller must observe process exit before reuse. Normal exit removes only the generated model/config files, never retained ACP data. A daemon may restart while its credential host remains alive. A full credential-host restart needs a fresh isolated agent directory if state remains: preserve the old directory and keep the canonical validator checkout, branch and validation generation unchanged so restart cannot replenish the repair allowance. Outbound networking remains available.
+
+After cancellation of an in-flight model request, check the credential owner before dispatching another validation. A daemon-only restart cannot restore a terminated credential host: preserve the retired agent directory, create a fresh owned profile, and restart the daemon with its new `PI_CODING_AGENT_DIR`. Keep the selected model, canonical checkout, branch, validation generation and existing repair receipts unchanged. Never enable fallback or replenish repairs to work around lost model availability.
+
 ## no-mistakes
 
 Attach to the active pipeline run for the current branch when one exists. If none exists, bare `no-mistakes` can start the setup wizard to create a branch, commit changes, push through the gate, wait for the daemon to register the new run, and then attach. If the push succeeds but no run is registered, that wizard path now exits with an explicit error instead of silently falling through. By default this wizard path is interactive and only runs in a TTY session. In non-interactive contexts, bare `no-mistakes` falls back to showing the last 5 runs inline unless you pass `-y` or `--yes` to run the wizard and accept defaults automatically. When a TTY is available, `-y` keeps the wizard visible, shows a brief `waiting for run…` state after push, and auto-advances the default path; without a TTY it falls back to the headless path.

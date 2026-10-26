@@ -1048,3 +1048,34 @@ This is a global default. Per-repo config can override it via `providers.azurede
 ## Environment variables
 
 See [Environment Variables](/no-mistakes/reference/environment/) for `NM_HOME`, `NM_DAEMON_CONNECT_TIMEOUT`, Forgejo host and token settings, Bitbucket Cloud credentials, and update-check suppression.
+
+## `controlled_execution` (authorized Factory fork)
+
+Default: `false`. This machine-global opt-in is not a repository setting.
+
+```yaml
+controlled_execution: true
+agent: acp:omp
+```
+
+Controlled runs require a strict launch nonce and validation generation before daemon-native startup effects or pipeline steps. The caller must keep the validation generation stable for the entire card execution, including replacement runs, retries, restarts, passive base refreshes and revalidation; use a new nonce for a new validation attempt, not a new generation. Generations and nonces contain 1–128 ASCII letters, digits, `.`, `_`, `~` or `-`.
+
+The durable allowance is **three repair passes shared across all phases and replacement runs** with the same canonical repository checkout path, branch and generation. A pass consumes its reservation before mutation dispatch. Failure, interruption, uncertain completion, stopping and replacement do not refund it. The fourth repair parks without starting a repair agent. Repository configuration and `auto_fix.*` cannot increase this ceiling. The caller must retain the same canonical validator checkout across mirror recreation; a different checkout path is a different identity, not a verified continuation.
+
+Ejecting a repository removes its run-scoped gates, response receipts and repair records with the ordinary run history. It does not refund the canonical generation's spent allowance: re-registering the same checkout, branch and generation retains the counter.
+
+Initial Review, Test, Document and Lint are assessment-only. Required documentation and commandless-lint changes become findings rather than silent edits. Configured prepare/test/lint/format commands also run read-only, including their subprocess descendants; commands that require source-local dependencies or formatter writes must be changed to use an external runtime directory or reported as requiring repair. Evidence and scratch output remain writable. An explicitly authorized repair pass grants product/Git writes only to its reserved repair turn; the subsequent reviewer, evidence and analyzer turns remain read-only.
+
+The supported execution prerequisite is Linux with usable `bwrap` user namespaces and the default `acp:omp` adapter. Other platforms, ACP registry command overrides and unsupported adapters fail closed. The configured executable must belong to its nearest `acpx` package; unknown wrapper packages are refused. Only that package's declared installed dependency closure and exact Node/omp executables from the explicit PATH are exposed, not an enclosing home or all neighboring packages. The trusted caller must pin and verify those artifacts.
+
+Controlled runs always use the generated, project-suppressed `omp acp` launch, even when the repository's ordinary `disable_project_settings` setting is false. They never delegate the bare `omp` alias to acpx: acpx 0.21 resolves it to the interactive CLI rather than an ACP server. User-supplied registry command overrides remain unsupported.
+
+The environment must explicitly provide an isolated, caller-owned `PI_CODING_AGENT_DIR`, outside protected product/Git paths. It must already contain the approved isolated model and credential-transport configuration. The fork never copies user authentication or configuration. Each invocation gets a disposable HOME. Writable evidence/runtime trees must be exclusively owned by the trusted caller, cannot overlap protected paths, and cannot contain hardlink aliases. Parent Git disables executable hooks/drivers; evidence publication receives only its explicitly granted scratch-index directory.
+
+The native Git boundary also covers daemon startup, trusted-config fetches, recovery, gate migration and worktree cleanup. Creating a checkout grants only its exact precreated empty destination, never its parent or siblings. Cleanup requires the durable owner and reciprocal Git registration; an unknown or redirected tree is preserved rather than recursively deleted. Repository enrollment keeps this metadata protected after the global switch is disabled.
+
+Controlled native fetch/push/query operations support the private **local** validation and evidence mirrors only. Receiver/upload-server execution is hardened separately because local Git does not forward the caller's hook settings. SSH/HTTP targets, URL rewrites and custom transport executables are refused in controlled mode; ordinary opt-out remote behavior is unchanged.
+
+This is a filesystem/process boundary, not universal hostile-code or network isolation: outbound networking remains available. Protect reachable control services separately. The earlier compatibility experiment's loopback script remains test-only; [`axi factory-auth`](/no-mistakes/reference/cli/#controlled-factory-credential-host) is the maintained, caller-owned credential transport for approved read-only source profiles. Independently launched implementing agents are outside this fork's ledger; an orchestrator must reserve its shared card-wide allowance before those repairs and before each strict no-mistakes fix.
+
+Controlled mutation turns do not use provider retries, session-resume fallback or provider fallback. A durably admitted but uncertain dispatch cannot be replayed automatically. Enrollment remains authoritative for an existing run even if the machine opt-in is subsequently disabled. Runs never enrolled in this mode retain upstream behavior.
