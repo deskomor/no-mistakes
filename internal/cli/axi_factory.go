@@ -69,6 +69,7 @@ func newAxiFactoryRespondCmd() *cobra.Command {
 
 func newAxiFactoryLookupCmd(receipt bool) *cobra.Command {
 	var runID, operationID string
+	var details bool
 	name := "factory-gate"
 	if receipt {
 		name = "factory-receipt"
@@ -89,6 +90,8 @@ func newAxiFactoryLookupCmd(receipt bool) *cobra.Command {
 		var value any
 		if receipt {
 			value, err = database.GetFactoryResponseReceipt(runID, operationID)
+		} else if details {
+			value, err = database.GetFactoryGateDetails(runID)
 		} else {
 			value, err = database.GetFactoryGate(runID)
 		}
@@ -100,6 +103,8 @@ func newAxiFactoryLookupCmd(receipt bool) *cobra.Command {
 	cmd.Flags().StringVar(&runID, "run", "", "Exact durable run ID")
 	if receipt {
 		cmd.Flags().StringVar(&operationID, "operation", "", "Exact response operation ID")
+	} else {
+		cmd.Flags().BoolVar(&details, "details", false, "Read full structured findings bound to the current exact parked gate")
 	}
 	return cmd
 }

@@ -79,6 +79,59 @@ func (d *DB) GetFactoryGate(runID string) (*FactoryGate, error) {
 	return scanFactoryGate(d.sql.QueryRow(`SELECT run_id,gate_id,step_result_id,round,generation,head_sha,state FROM factory_gates WHERE run_id=?`, runID))
 }
 
+// FactoryGateDetails is one SQLite snapshot of the strict gate and its original
+// structured findings. The compact AXI display is not an authorization source.
+type FactoryGateDetails struct {
+	Gate          FactoryGate     `json:"gate"`
+	Findings      []types.Finding `json:"findings"`
+	Summary       string          `json:"summary,omitempty"`
+	Risk          string          `json:"risk,omitempty"`
+	RiskRationale string          `json:"risk_rationale,omitempty"`
+	RiskScope     string          `json:"risk_scope,omitempty"`
+}
+
+func (d *DB) GetFactoryGateDetails(runID string) (*FactoryGateDetails, error) {
+	v := &FactoryGateDetails{Findings: []types.Finding{}}
+	var raw sql.NullString
+	var head, runStatus, stepStatus string
+	var stopping int
+	// One joined statement binds all fields to the same read snapshot, including
+	// when another connection replaces the park or advances the run concurrently.
+	err := d.sql.QueryRow(`SELECT g.run_id,g.gate_id,g.step_result_id,g.round,g.generation,g.head_sha,g.state,
+		s.findings_json,COALESCE(r.head_sha,''),COALESCE(r.status,''),COALESCE(s.status,''),COALESCE(f.stopping,1)
+		FROM factory_gates g
+		LEFT JOIN runs r ON r.id=g.run_id
+		LEFT JOIN step_results s ON s.id=g.step_result_id AND s.run_id=g.run_id
+		LEFT JOIN factory_response_fences f ON f.run_id=g.run_id
+		WHERE g.run_id=?`, runID).Scan(&v.Gate.RunID, &v.Gate.GateID, &v.Gate.StepResultID,
+		&v.Gate.Round, &v.Gate.Generation, &v.Gate.HeadSHA, &v.Gate.State, &raw,
+		&head, &runStatus, &stepStatus, &stopping)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if v.Gate.State != "parked" || head != v.Gate.HeadSHA || runStatus != "running" ||
+		stepStatus != string(types.StepStatusAwaitingApproval) || stopping != 0 {
+		return nil, fmt.Errorf("stale or unavailable gate details")
+	}
+	if raw.Valid && raw.String != "" {
+		findings, err := types.ParseFindingsJSON(raw.String)
+		if err != nil {
+			return nil, fmt.Errorf("invalid gate findings: %w", err)
+		}
+		if findings.Items != nil {
+			v.Findings = findings.Items
+		}
+		v.Summary = findings.Summary
+		v.Risk = findings.RiskLevel
+		v.RiskRationale = findings.RiskRationale
+		v.RiskScope = findings.RiskScope
+	}
+	return v, nil
+}
+
 // ParkFactoryGate always increments the durable generation. Recovery reads the
 // existing park instead; it must never manufacture a fresh authorization.
 func (d *DB) ParkFactoryGate(runID, stepID string, round int, head string) (*FactoryGate, error) {
